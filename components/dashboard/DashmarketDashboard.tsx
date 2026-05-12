@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   BarChart3,
   Boxes,
@@ -9,6 +9,7 @@ import {
   CircleDollarSign,
   ClipboardList,
   LineChart,
+  LogOut,
   Megaphone,
   PackageCheck,
   PackagePlus,
@@ -28,8 +29,33 @@ import {
 } from "@/lib/metrics/contribution-margin";
 import { getMarketplaceAdapter, listMarketplaceAdapters } from "@/lib/marketplaces/registry";
 import type { MarketplaceProvider } from "@/lib/marketplaces/types";
+import { createBrowserSupabaseClient } from "@/lib/supabase/browser";
 
 type ViewKey = "margem" | "custos" | "estoque" | "ads";
+type SupabaseStatus = "checking" | "demo" | "connected" | "error";
+
+type Organization = {
+  id: string;
+  name: string;
+  slug: string;
+};
+
+type ProductRow = {
+  id: string;
+  internal_sku: string;
+  title: string;
+};
+
+type CostCenterRow = {
+  id: string;
+  cost_name: string;
+  cost_category: SkuCost["category"];
+  allocation_method: SkuCost["allocation"];
+  amount: number | string;
+  valid_from: string;
+  valid_to: string | null;
+  products: ProductRow | ProductRow[] | null;
+};
 
 const salesSeed: SaleRecord[] = [
   {
@@ -322,12 +348,47 @@ function marginTone(row: ContributionMarginRow) {
   return "text-sea";
 }
 
+function getRelatedProduct(row: CostCenterRow) {
+  if (Array.isArray(row.products)) return row.products[0] ?? null;
+  return row.products;
+}
+
+function mapCostCenterRow(row: CostCenterRow): SkuCost | null {
+  const product = getRelatedProduct(row);
+  if (!product) return null;
+
+  return {
+    id: row.id,
+    sku: product.internal_sku,
+    label: row.cost_name,
+    category: row.cost_category,
+    amount: Number(row.amount),
+    allocation: row.allocation_method,
+    validFrom: row.valid_from,
+    validTo: row.valid_to ?? undefined
+  };
+}
+
 export function DashmarketDashboard() {
+  const [supabaseClient] = useState(() => {
+    try {
+      return createBrowserSupabaseClient();
+    } catch {
+      return null;
+    }
+  });
   const [selectedProvider, setSelectedProvider] =
     useState<MarketplaceProvider>("mercadolivre");
   const [activeView, setActiveView] = useState<ViewKey>("margem");
   const [skuFilter, setSkuFilter] = useState("");
   const [costs, setCosts] = useState<SkuCost[]>(costsSeed);
+  const [organization, setOrganization] = useState<Organization | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [supabaseStatus, setSupabaseStatus] =
+    useState<SupabaseStatus>("checking");
+  const [realProducts, setRealProducts] = useState<ProductRow[]>([]);
+  const [dataMessage, setDataMessage] = useState<string | null>(null);
+  const [isSavingCost, setIsSavingCost] = useState(false);
   const [costForm, setCostForm] = useState({
     sku: salesSeed[0].sku,
     label: "",
@@ -336,6 +397,17 @@ export function DashmarketDashboard() {
     allocation: "per_unit" as SkuCost["allocation"],
     validFrom: "2026-05-01"
   });
+
+  const productOptions = useMemo(
+    () =>
+      realProducts.length > 0
+        ? realProducts.map((product) => ({
+            sku: product.internal_sku,
+            title: product.title
+          }))
+        : salesSeed.map((sale) => ({ sku: sale.sku, title: sale.title })),
+    [realProducts]
+  );
 
   const selectedAdapter = getMarketplaceAdapter(selectedProvider);
   const marginRows = useMemo(
@@ -380,10 +452,165 @@ export function DashmarketDashboard() {
   const marginRate =
     totals.netRevenue > 0 ? totals.contributionMargin / totals.netRevenue : 0;
 
-  function addCost(event: FormEvent<HTMLFormElement>) {
+  const loadCostCenter = useCallback(async (organizationId: string) => {
+    if (!supabaseClient) return;
+
+    const { data: productsData, error: productsError } = await supabaseClient
+      .from("products")
+      .select("id, internal_sku, title")
+      .eq("organization_id", organizationId)
+      .order("internal_sku", { ascending: true });
+
+    if (productsError) throw productsError;
+
+    const products = (productsData ?? []) as ProductRow[];
+    setRealProducts(products);
+
+    const { data: costsData, error: costsError } = await supabaseClient
+      .from("sku_costs")
+      .select(
+        "id, cost_name, cost_category, allocation_method, amount, valid_from, valid_to, products(id, internal_sku, title)"
+      )
+      .eq("organization_id", organizationId)
+      .order("valid_from", { ascending: false });
+
+    if (costsError) throw costsError;
+
+    const mappedCosts = ((costsData ?? []) as CostCenterRow[])
+      .map(mapCostCenterRow)
+      .filter((cost): cost is SkuCost => Boolean(cost));
+
+    setCosts(mappedCosts);
+  }, [supabaseClient]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadWorkspace() {
+      if (!supabaseClient) {
+        setSupabaseStatus("demo");
+        setCosts(costsSeed);
+        return;
+      }
+
+      try {
+        const { data: sessionData, error: sessionError } =
+          await supabaseClient.auth.getSession();
+
+        if (sessionError) throw sessionError;
+
+        const session = sessionData.session;
+        if (!session) {
+          if (!isMounted) return;
+          setSupabaseStatus("demo");
+          setUserEmail(null);
+          setOrganization(null);
+          setRealProducts([]);
+          setCosts(costsSeed);
+          return;
+        }
+
+        const { data: organizationsData, error: organizationsError } =
+          await supabaseClient
+            .from("organizations")
+            .select("id, name, slug")
+            .order("created_at", { ascending: true })
+            .limit(1);
+
+        if (organizationsError) throw organizationsError;
+
+        const currentOrganization =
+          ((organizationsData ?? [])[0] as Organization | undefined) ?? null;
+
+        if (!isMounted) return;
+
+        setUserEmail(session.user.email ?? null);
+        setOrganization(currentOrganization);
+        setSupabaseStatus("connected");
+
+        if (currentOrganization) {
+          await loadCostCenter(currentOrganization.id);
+        } else {
+          setCosts([]);
+          setDataMessage("Usuario autenticado, mas sem empresa vinculada.");
+        }
+      } catch (error) {
+        if (!isMounted) return;
+        setSupabaseStatus("error");
+        setCosts(costsSeed);
+        setDataMessage(
+          error instanceof Error
+            ? error.message
+            : "Nao foi possivel carregar os dados do Supabase."
+        );
+      }
+    }
+
+    loadWorkspace();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [loadCostCenter, supabaseClient]);
+
+  async function addCost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     if (!costForm.label.trim() || !costForm.amount) return;
+
+    if (supabaseClient && organization) {
+      setIsSavingCost(true);
+      setDataMessage(null);
+
+      try {
+        let product = realProducts.find(
+          (currentProduct) => currentProduct.internal_sku === costForm.sku
+        );
+
+        if (!product) {
+          const seedProduct = salesSeed.find((sale) => sale.sku === costForm.sku);
+          const { data: insertedProduct, error: productError } =
+            await supabaseClient
+              .from("products")
+              .insert({
+                organization_id: organization.id,
+                internal_sku: costForm.sku,
+                title: seedProduct?.title ?? costForm.sku
+              })
+              .select("id, internal_sku, title")
+              .single();
+
+          if (productError) throw productError;
+          product = insertedProduct as ProductRow;
+        }
+
+        const { error: costError } = await supabaseClient.from("sku_costs").insert({
+          organization_id: organization.id,
+          product_id: product.id,
+          cost_name: costForm.label.trim(),
+          cost_category: costForm.category,
+          allocation_method: costForm.allocation,
+          amount: Number(costForm.amount),
+          valid_from: costForm.validFrom
+        });
+
+        if (costError) throw costError;
+
+        await loadCostCenter(organization.id);
+        setCostForm((current) => ({ ...current, label: "", amount: "" }));
+        setDataMessage("Custo salvo no Supabase.");
+      } catch (error) {
+        setDataMessage(
+          error instanceof Error
+            ? error.message
+            : "Nao foi possivel salvar o custo."
+        );
+      } finally {
+        setIsSavingCost(false);
+      }
+
+      return;
+    }
 
     setCosts((current) => [
       ...current,
@@ -404,6 +631,17 @@ export function DashmarketDashboard() {
     setCostForm((current) => ({ ...current, label: "", amount: "" }));
   }
 
+  async function signOut() {
+    if (!supabaseClient) return;
+    await supabaseClient.auth.signOut();
+    setSupabaseStatus("demo");
+    setUserEmail(null);
+    setOrganization(null);
+    setRealProducts([]);
+    setCosts(costsSeed);
+    setDataMessage("Sessao encerrada.");
+  }
+
   return (
     <main className="min-h-screen bg-paper text-ink">
       <div className="flex min-h-screen flex-col lg:flex-row">
@@ -420,13 +658,24 @@ export function DashmarketDashboard() {
                 </div>
               </div>
             </div>
-            <Link
-              className="inline-flex h-9 items-center gap-2 rounded-lg bg-white/10 px-3 text-sm font-semibold text-white ring-1 ring-white/20 hover:bg-white/20 lg:mt-6"
-              href="/login"
-            >
-              <ShieldCheck aria-hidden className="h-4 w-4" />
-              Entrar
-            </Link>
+            {supabaseStatus === "connected" ? (
+              <button
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-white/10 px-3 text-sm font-semibold text-white ring-1 ring-white/20 hover:bg-white/20 lg:mt-6"
+                onClick={signOut}
+                type="button"
+              >
+                <LogOut aria-hidden className="h-4 w-4" />
+                Sair
+              </button>
+            ) : (
+              <Link
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-white/10 px-3 text-sm font-semibold text-white ring-1 ring-white/20 hover:bg-white/20 lg:mt-6"
+                href="/login"
+              >
+                <ShieldCheck aria-hidden className="h-4 w-4" />
+                Entrar
+              </Link>
+            )}
           </div>
 
           <nav className="mt-5 grid grid-cols-2 gap-2 lg:grid-cols-1">
@@ -459,6 +708,17 @@ export function DashmarketDashboard() {
             <p className="mt-1 text-sm text-white/60">
               Estrutura pronta para multiplos marketplaces.
             </p>
+            <div className="mt-4 rounded-lg bg-black/15 p-3 text-xs text-white/72">
+              <p className="font-bold text-white">
+                {organization?.name ?? "Modo demonstrativo"}
+              </p>
+              <p className="mt-1">
+                {userEmail ??
+                  (supabaseStatus === "checking"
+                    ? "Verificando sessao"
+                    : "Entre para gravar custos reais")}
+              </p>
+            </div>
             <div className="mt-4 flex flex-wrap gap-2">
               {selectedAdapter.capabilities.map((capability) => (
                 <span
@@ -567,6 +827,20 @@ export function DashmarketDashboard() {
             </div>
           </section>
 
+          {(dataMessage || supabaseStatus === "connected") && (
+            <section className="mt-4 rounded-lg border border-black/10 bg-white px-4 py-3 text-sm shadow-sm">
+              <p className="font-semibold text-ink">
+                {supabaseStatus === "connected"
+                  ? `Supabase conectado${organization ? `: ${organization.name}` : ""}`
+                  : "Modo demonstrativo"}
+              </p>
+              <p className="mt-1 text-black/60">
+                {dataMessage ??
+                  "Custos cadastrados nesta tela ja sao salvos no banco. Vendas, estoque e publicidade seguem demonstrativos ate conectarmos o Mercado Livre."}
+              </p>
+            </section>
+          )}
+
           {activeView === "margem" && (
             <section className="mt-5 rounded-lg border border-black/10 bg-white shadow-sm">
               <div className="flex flex-col gap-2 border-b border-black/10 p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -655,12 +929,17 @@ export function DashmarketDashboard() {
                       }
                       value={costForm.sku}
                     >
-                      {salesSeed.map((sale) => (
-                        <option key={sale.sku} value={sale.sku}>
-                          {sale.sku}
+                      {productOptions.map((product) => (
+                        <option key={product.sku} value={product.sku}>
+                          {product.sku}
                         </option>
                       ))}
                     </select>
+                    <span className="text-xs font-normal text-black/50">
+                      {supabaseStatus === "connected"
+                        ? "Se o SKU ainda nao existir, ele sera criado no Supabase."
+                        : "Entre para salvar este cadastro no banco."}
+                    </span>
                   </label>
 
                   <label className="grid gap-1 text-sm font-semibold">
@@ -756,10 +1035,11 @@ export function DashmarketDashboard() {
 
                   <button
                     className="mt-1 inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-ink px-4 text-sm font-bold text-white hover:bg-black"
+                    disabled={isSavingCost}
                     type="submit"
                   >
                     <PackagePlus aria-hidden className="h-4 w-4" />
-                    Adicionar custo
+                    {isSavingCost ? "Salvando" : "Adicionar custo"}
                   </button>
                 </div>
               </form>

@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
 import { ArrowLeft, LockKeyhole, Mail, ShieldCheck } from "lucide-react";
 import { createBrowserSupabaseClient } from "@/lib/supabase/browser";
 
 export function LoginPanel() {
+  const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -26,6 +28,7 @@ export function LoginPanel() {
       if (error) throw error;
 
       setStatus("Acesso confirmado. O painel ja pode carregar dados da empresa.");
+      router.push("/");
     } catch (error) {
       setStatus(
         error instanceof Error
