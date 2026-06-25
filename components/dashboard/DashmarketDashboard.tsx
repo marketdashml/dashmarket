@@ -27,6 +27,10 @@ import {
   type SaleRecord,
   type SkuCost
 } from "@/lib/metrics/contribution-margin";
+import {
+  MarginHistoryChart,
+  type MarginSnapshot
+} from "@/components/dashboard/MarginHistoryChart";
 import { getMarketplaceAdapter, listMarketplaceAdapters } from "@/lib/marketplaces/registry";
 import type { MarketplaceProvider } from "@/lib/marketplaces/types";
 import { createBrowserSupabaseClient } from "@/lib/supabase/browser";
@@ -395,6 +399,8 @@ export function DashmarketDashboard() {
   const [inventoryData, setInventoryData] =
     useState<InventoryRow[]>(inventoryRows);
   const [adsData, setAdsData] = useState<AdvertisingSpend[]>(adSpendSeed);
+  const [marginSnapshots, setMarginSnapshots] = useState<MarginSnapshot[]>([]);
+  const [marginPeriod, setMarginPeriod] = useState<30 | 60 | 90>(90);
   const [isSyncing, setIsSyncing] = useState(false);
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -620,6 +626,46 @@ export function DashmarketDashboard() {
     if (rows.length > 0) setAdsData(rows);
   }, [supabaseClient]);
 
+  const loadMarginHistory = useCallback(
+    async (organizationId: string, days: number) => {
+      if (!supabaseClient) return;
+
+      const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+
+      const { data } = await supabaseClient
+        .from("contribution_margin_snapshots")
+        .select(
+          "period_end, contribution_margin_percent, products!inner(internal_sku, title)"
+        )
+        .eq("organization_id", organizationId)
+        .gte("period_end", from)
+        .order("period_end", { ascending: true });
+
+      if (!data || data.length === 0) return;
+
+      type RawRow = {
+        period_end: string;
+        contribution_margin_percent: number | null;
+        products: { internal_sku: string; title: string } | { internal_sku: string; title: string }[];
+      };
+
+      const snaps: MarginSnapshot[] = (data as RawRow[]).map((row) => {
+        const product = Array.isArray(row.products) ? row.products[0] : row.products;
+        return {
+          period_end: row.period_end,
+          sku: product?.internal_sku ?? "—",
+          title: product?.title ?? "—",
+          contribution_margin_percent: row.contribution_margin_percent ?? 0
+        };
+      });
+
+      setMarginSnapshots(snaps);
+    },
+    [supabaseClient]
+  );
+
   const loadCostCenter = useCallback(async (organizationId: string) => {
     if (!supabaseClient) return;
 
@@ -701,7 +747,8 @@ export function DashmarketDashboard() {
             loadCostCenter(currentOrganization.id),
             loadSalesData(currentOrganization.id),
             loadInventory(currentOrganization.id),
-            loadAds(currentOrganization.id)
+            loadAds(currentOrganization.id),
+            loadMarginHistory(currentOrganization.id, 90)
           ]);
         } else {
           setCosts([]);
@@ -724,7 +771,7 @@ export function DashmarketDashboard() {
     return () => {
       isMounted = false;
     };
-  }, [loadCostCenter, loadSalesData, loadInventory, loadAds, supabaseClient]);
+  }, [loadCostCenter, loadSalesData, loadInventory, loadAds, loadMarginHistory, supabaseClient]);
 
   async function addCost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -803,6 +850,12 @@ export function DashmarketDashboard() {
 
     setCostForm((current) => ({ ...current, label: "", amount: "" }));
   }
+
+  useEffect(() => {
+    if (organization && supabaseStatus === "connected") {
+      loadMarginHistory(organization.id, marginPeriod);
+    }
+  }, [marginPeriod, organization, supabaseStatus, loadMarginHistory]);
 
   async function signOut() {
     if (!supabaseClient) return;
@@ -1084,7 +1137,38 @@ export function DashmarketDashboard() {
           )}
 
           {activeView === "margem" && (
+            <>
             <section className="mt-5 rounded-lg border border-black/10 bg-white shadow-sm">
+              <div className="flex flex-col gap-2 border-b border-black/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="text-lg font-bold">Evolução da margem de contribuição</h2>
+                  <p className="text-sm text-black/60">
+                    Percentual de margem por SKU ao longo do tempo.
+                  </p>
+                </div>
+                <div className="flex rounded-lg bg-paper p-1 ring-1 ring-black/10">
+                  {([30, 60, 90] as const).map((days) => (
+                    <button
+                      className={`h-8 rounded-md px-3 text-sm font-semibold transition ${
+                        marginPeriod === days
+                          ? "bg-ink text-white"
+                          : "text-black/60 hover:bg-black/[0.04]"
+                      }`}
+                      key={days}
+                      onClick={() => setMarginPeriod(days)}
+                      type="button"
+                    >
+                      {days}d
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="p-4">
+                <MarginHistoryChart snapshots={marginSnapshots} />
+              </div>
+            </section>
+
+            <section className="mt-4 rounded-lg border border-black/10 bg-white shadow-sm">
               <div className="flex flex-col gap-2 border-b border-black/10 p-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h2 className="text-lg font-bold">Conciliação da margem por SKU</h2>
@@ -1145,6 +1229,7 @@ export function DashmarketDashboard() {
                 </table>
               </div>
             </section>
+            </>
           )}
 
           {activeView === "custos" && (
