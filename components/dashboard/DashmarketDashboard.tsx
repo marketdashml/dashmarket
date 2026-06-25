@@ -382,6 +382,8 @@ export function DashmarketDashboard() {
   const [activeView, setActiveView] = useState<ViewKey>("margem");
   const [skuFilter, setSkuFilter] = useState("");
   const [costs, setCosts] = useState<SkuCost[]>(costsSeed);
+  const [salesData, setSalesData] = useState<SaleRecord[]>(salesSeed);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [supabaseStatus, setSupabaseStatus] =
@@ -390,7 +392,7 @@ export function DashmarketDashboard() {
   const [dataMessage, setDataMessage] = useState<string | null>(null);
   const [isSavingCost, setIsSavingCost] = useState(false);
   const [costForm, setCostForm] = useState({
-    sku: salesSeed[0].sku,
+    sku: salesSeed[0]?.sku ?? "",
     label: "",
     category: "product" as SkuCost["category"],
     amount: "",
@@ -405,14 +407,14 @@ export function DashmarketDashboard() {
             sku: product.internal_sku,
             title: product.title
           }))
-        : salesSeed.map((sale) => ({ sku: sale.sku, title: sale.title })),
-    [realProducts]
+        : salesData.map((sale) => ({ sku: sale.sku, title: sale.title })),
+    [realProducts, salesData]
   );
 
   const selectedAdapter = getMarketplaceAdapter(selectedProvider);
   const marginRows = useMemo(
-    () => calculateContributionMargins(salesSeed, costs, adSpendSeed),
-    [costs]
+    () => calculateContributionMargins(salesData, costs, adSpendSeed),
+    [salesData, costs]
   );
 
   const filteredMargins = marginRows.filter((row) => {
@@ -451,6 +453,75 @@ export function DashmarketDashboard() {
 
   const marginRate =
     totals.netRevenue > 0 ? totals.contributionMargin / totals.netRevenue : 0;
+
+  const loadSalesData = useCallback(async (organizationId: string) => {
+    if (!supabaseClient) return;
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: orderItems } = await supabaseClient
+      .from("order_items")
+      .select(
+        "seller_sku, title, quantity, unit_price, gross_amount, marketplace_fee_amount, shipping_cost_amount, discount_amount, orders!inner(organization_id, sold_at, status, shipping_cost_amount, discounts_amount, taxes_amount)"
+      )
+      .eq("orders.organization_id", organizationId)
+      .gte("orders.sold_at", thirtyDaysAgo)
+      .neq("orders.status", "cancelled");
+
+    if (!orderItems || orderItems.length === 0) return;
+
+    type OrderItemRow = {
+      seller_sku: string | null;
+      title: string;
+      quantity: number;
+      unit_price: number;
+      gross_amount: number;
+      marketplace_fee_amount: number;
+      shipping_cost_amount: number;
+      discount_amount: number;
+      orders: {
+        organization_id: string;
+        sold_at: string;
+        status: string;
+        shipping_cost_amount: number;
+        discounts_amount: number;
+        taxes_amount: number;
+      };
+    };
+
+    const grouped = new Map<string, SaleRecord>();
+
+    for (const item of orderItems as unknown as OrderItemRow[]) {
+      const sku = item.seller_sku ?? item.title;
+      const existing = grouped.get(sku);
+
+      if (existing) {
+        existing.units += item.quantity;
+        existing.orders += 1;
+        existing.grossRevenue += item.gross_amount;
+        existing.marketplaceFees += item.marketplace_fee_amount;
+        existing.shippingCosts += item.shipping_cost_amount;
+        existing.discounts += item.discount_amount;
+      } else {
+        grouped.set(sku, {
+          sku,
+          title: item.title,
+          units: item.quantity,
+          orders: 1,
+          grossRevenue: item.gross_amount,
+          marketplaceFees: item.marketplace_fee_amount,
+          shippingCosts: item.shipping_cost_amount,
+          discounts: item.discount_amount,
+          taxes: 0
+        });
+      }
+    }
+
+    const records = Array.from(grouped.values());
+    if (records.length > 0) {
+      setSalesData(records);
+    }
+  }, [supabaseClient]);
 
   const loadCostCenter = useCallback(async (organizationId: string) => {
     if (!supabaseClient) return;
@@ -529,7 +600,10 @@ export function DashmarketDashboard() {
         setSupabaseStatus("connected");
 
         if (currentOrganization) {
-          await loadCostCenter(currentOrganization.id);
+          await Promise.all([
+            loadCostCenter(currentOrganization.id),
+            loadSalesData(currentOrganization.id)
+          ]);
         } else {
           setCosts([]);
           setDataMessage("Usuario autenticado, mas sem empresa vinculada.");
@@ -551,7 +625,7 @@ export function DashmarketDashboard() {
     return () => {
       isMounted = false;
     };
-  }, [loadCostCenter, supabaseClient]);
+  }, [loadCostCenter, loadSalesData, supabaseClient]);
 
   async function addCost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -639,7 +713,56 @@ export function DashmarketDashboard() {
     setOrganization(null);
     setRealProducts([]);
     setCosts(costsSeed);
+    setSalesData(salesSeed);
     setDataMessage("Sessao encerrada.");
+  }
+
+  async function syncOrders() {
+    if (!supabaseClient || supabaseStatus !== "connected") return;
+
+    setIsSyncing(true);
+    setDataMessage(null);
+
+    try {
+      const { data: sessionData } = await supabaseClient.auth.getSession();
+      const token = sessionData.session?.access_token;
+
+      if (!token) throw new Error("Sessao expirada.");
+
+      const response = await fetch("/api/marketplaces/mercadolivre/sync", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ days_back: 30 })
+      });
+
+      const result = (await response.json()) as {
+        ok?: boolean;
+        error?: string;
+        accounts?: { records_processed?: number; error?: string }[];
+      };
+
+      if (!response.ok) {
+        throw new Error(result.error ?? "Erro ao sincronizar.");
+      }
+
+      const processed =
+        result.accounts?.reduce((sum, a) => sum + (a.records_processed ?? 0), 0) ?? 0;
+
+      if (organization) {
+        await loadSalesData(organization.id);
+      }
+
+      setDataMessage(`Sincronizacao concluida. ${processed} pedido(s) processado(s).`);
+    } catch (error) {
+      setDataMessage(
+        error instanceof Error ? error.message : "Erro ao sincronizar vendas."
+      );
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
   return (
@@ -761,11 +884,16 @@ export function DashmarketDashboard() {
                 ))}
               </div>
               <button
-                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-sea px-4 text-sm font-bold text-white shadow-sm hover:bg-teal-800"
+                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-sea px-4 text-sm font-bold text-white shadow-sm hover:bg-teal-800 disabled:opacity-50"
+                disabled={isSyncing || supabaseStatus !== "connected"}
+                onClick={syncOrders}
                 type="button"
               >
-                <RefreshCw aria-hidden className="h-4 w-4" />
-                Sincronizar
+                <RefreshCw
+                  aria-hidden
+                  className={`h-4 w-4 ${isSyncing ? "animate-spin" : ""}`}
+                />
+                {isSyncing ? "Sincronizando..." : "Sincronizar"}
               </button>
             </div>
           </header>
