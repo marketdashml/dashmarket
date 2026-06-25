@@ -477,61 +477,70 @@ export function DashmarketDashboard() {
 
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    const { data: orderItems } = await supabaseClient
-      .from("order_items")
+    // Filtra na tabela principal (orders) e expande os itens via join.
+    // Filtros em tabelas relacionadas via !inner são ignorados pelo Supabase JS.
+    const { data: orders } = await supabaseClient
+      .from("orders")
       .select(
-        "seller_sku, title, quantity, unit_price, gross_amount, marketplace_fee_amount, shipping_cost_amount, discount_amount, orders!inner(organization_id, sold_at, status, shipping_cost_amount, discounts_amount, taxes_amount)"
+        "shipping_cost_amount, discounts_amount, taxes_amount, gross_amount, order_items(seller_sku, title, quantity, gross_amount, marketplace_fee_amount, shipping_cost_amount, discount_amount)"
       )
-      .eq("orders.organization_id", organizationId)
-      .gte("orders.sold_at", thirtyDaysAgo)
-      .neq("orders.status", "cancelled");
+      .eq("organization_id", organizationId)
+      .gte("sold_at", thirtyDaysAgo)
+      .neq("status", "cancelled");
 
-    if (!orderItems || orderItems.length === 0) return;
+    if (!orders || orders.length === 0) return;
 
-    type OrderItemRow = {
-      seller_sku: string | null;
-      title: string;
-      quantity: number;
-      unit_price: number;
-      gross_amount: number;
-      marketplace_fee_amount: number;
+    type OrderRow = {
       shipping_cost_amount: number;
-      discount_amount: number;
-      orders: {
-        organization_id: string;
-        sold_at: string;
-        status: string;
+      discounts_amount: number;
+      taxes_amount: number;
+      gross_amount: number;
+      order_items: {
+        seller_sku: string | null;
+        title: string;
+        quantity: number;
+        gross_amount: number;
+        marketplace_fee_amount: number;
         shipping_cost_amount: number;
-        discounts_amount: number;
-        taxes_amount: number;
-      };
+        discount_amount: number;
+      }[];
     };
 
     const grouped = new Map<string, SaleRecord>();
 
-    for (const item of orderItems as unknown as OrderItemRow[]) {
-      const sku = item.seller_sku ?? item.title;
-      const existing = grouped.get(sku);
+    for (const order of orders as unknown as OrderRow[]) {
+      for (const item of order.order_items ?? []) {
+        const sku = item.seller_sku ?? item.title;
 
-      if (existing) {
-        existing.units += item.quantity;
-        existing.orders += 1;
-        existing.grossRevenue += item.gross_amount;
-        existing.marketplaceFees += item.marketplace_fee_amount;
-        existing.shippingCosts += item.shipping_cost_amount;
-        existing.discounts += item.discount_amount;
-      } else {
-        grouped.set(sku, {
-          sku,
-          title: item.title,
-          units: item.quantity,
-          orders: 1,
-          grossRevenue: item.gross_amount,
-          marketplaceFees: item.marketplace_fee_amount,
-          shippingCosts: item.shipping_cost_amount,
-          discounts: item.discount_amount,
-          taxes: 0
-        });
+        // Rateia frete e desconto do pedido proporcionalmente ao valor bruto do item.
+        const ratio =
+          order.gross_amount > 0 ? item.gross_amount / order.gross_amount : 0;
+        const shippingAlloc = order.shipping_cost_amount * ratio;
+        const discountAlloc = order.discounts_amount * ratio;
+        const taxAlloc = order.taxes_amount * ratio;
+
+        const existing = grouped.get(sku);
+        if (existing) {
+          existing.units += item.quantity;
+          existing.orders += 1;
+          existing.grossRevenue += item.gross_amount;
+          existing.marketplaceFees += item.marketplace_fee_amount;
+          existing.shippingCosts += shippingAlloc;
+          existing.discounts += discountAlloc;
+          existing.taxes += taxAlloc;
+        } else {
+          grouped.set(sku, {
+            sku,
+            title: item.title,
+            units: item.quantity,
+            orders: 1,
+            grossRevenue: item.gross_amount,
+            marketplaceFees: item.marketplace_fee_amount,
+            shippingCosts: shippingAlloc,
+            discounts: discountAlloc,
+            taxes: taxAlloc
+          });
+        }
       }
     }
 
