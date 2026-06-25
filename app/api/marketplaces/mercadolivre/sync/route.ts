@@ -80,30 +80,32 @@ export async function POST(request: Request) {
   };
   const daysBack = typeof body.days_back === "number" ? body.days_back : 30;
 
-  const results = await Promise.allSettled(
-    accounts.map((account) =>
-      fetch(`${supabaseUrl}/functions/v1/mercadolivre-sync-orders`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${serviceRoleKey}`,
-          apikey: serviceRoleKey,
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          marketplace_account_id: account.id,
-          organization_id: organizationId,
-          days_back: daysBack
-        })
-      }).then((res) => res.json())
-    )
+  // Orquestrador: sincroniza listings, pedidos, estoque, publicidade e
+  // recalcula as margens de contribuicao para todas as contas da organizacao.
+  const response = await fetch(
+    `${supabaseUrl}/functions/v1/mercadolivre-sync-all`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${serviceRoleKey}`,
+        apikey: serviceRoleKey,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        organization_id: organizationId,
+        days_back: daysBack
+      })
+    }
   );
 
-  const summary = results.map((result, index) => ({
-    account_id: accounts[index].id,
-    ...(result.status === "fulfilled"
-      ? result.value
-      : { error: String(result.reason) })
-  }));
+  const result = await response.json().catch(() => ({}));
 
-  return NextResponse.json({ ok: true, accounts: summary });
+  if (!response.ok) {
+    return NextResponse.json(
+      { error: result.error ?? "Falha na sincronizacao." },
+      { status: 502 }
+    );
+  }
+
+  return NextResponse.json(result);
 }

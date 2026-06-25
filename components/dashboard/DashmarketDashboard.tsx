@@ -183,7 +183,16 @@ const adSpendSeed: AdvertisingSpend[] = [
   }
 ];
 
-const inventoryRows = [
+type InventoryRow = {
+  sku: string;
+  channel: string;
+  available: number;
+  reserved: number;
+  transfer: number;
+  status: string;
+};
+
+const inventoryRows: InventoryRow[] = [
   {
     sku: "MLB-CABO-USB-C-1M",
     channel: "Full",
@@ -383,6 +392,9 @@ export function DashmarketDashboard() {
   const [skuFilter, setSkuFilter] = useState("");
   const [costs, setCosts] = useState<SkuCost[]>(costsSeed);
   const [salesData, setSalesData] = useState<SaleRecord[]>(salesSeed);
+  const [inventoryData, setInventoryData] =
+    useState<InventoryRow[]>(inventoryRows);
+  const [adsData, setAdsData] = useState<AdvertisingSpend[]>(adSpendSeed);
   const [isSyncing, setIsSyncing] = useState(false);
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -413,8 +425,8 @@ export function DashmarketDashboard() {
 
   const selectedAdapter = getMarketplaceAdapter(selectedProvider);
   const marginRows = useMemo(
-    () => calculateContributionMargins(salesData, costs, adSpendSeed),
-    [salesData, costs]
+    () => calculateContributionMargins(salesData, costs, adsData),
+    [salesData, costs, adsData]
   );
 
   const filteredMargins = marginRows.filter((row) => {
@@ -523,6 +535,91 @@ export function DashmarketDashboard() {
     }
   }, [supabaseClient]);
 
+  const loadInventory = useCallback(async (organizationId: string) => {
+    if (!supabaseClient) return;
+
+    const { data } = await supabaseClient
+      .from("inventory_snapshots")
+      .select("seller_sku, fulfillment_channel, available_quantity, reserved_quantity, captured_at")
+      .eq("organization_id", organizationId)
+      .order("captured_at", { ascending: false })
+      .limit(500);
+
+    if (!data || data.length === 0) return;
+
+    type SnapshotRow = {
+      seller_sku: string | null;
+      fulfillment_channel: string;
+      available_quantity: number;
+      reserved_quantity: number;
+      captured_at: string;
+    };
+
+    // Mantem apenas o snapshot mais recente de cada sku+canal.
+    const seen = new Set<string>();
+    const rows: InventoryRow[] = [];
+
+    for (const snap of data as SnapshotRow[]) {
+      const sku = snap.seller_sku ?? "(sem SKU)";
+      const key = `${sku}-${snap.fulfillment_channel}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const available = snap.available_quantity;
+      const status =
+        available <= 5 ? "Critico" : available <= 20 ? "Atencao" : "Saudavel";
+
+      rows.push({
+        sku,
+        channel: snap.fulfillment_channel,
+        available,
+        reserved: snap.reserved_quantity,
+        transfer: 0,
+        status
+      });
+    }
+
+    if (rows.length > 0) setInventoryData(rows);
+  }, [supabaseClient]);
+
+  const loadAds = useCallback(async (organizationId: string) => {
+    if (!supabaseClient) return;
+
+    const { data } = await supabaseClient
+      .from("advertising_metrics")
+      .select(
+        "ad_spend_amount, clicks, impressions, attributed_revenue_amount, metric_date, advertising_campaigns!inner(name, organization_id)"
+      )
+      .eq("organization_id", organizationId)
+      .order("metric_date", { ascending: false })
+      .limit(200);
+
+    if (!data || data.length === 0) return;
+
+    type MetricRow = {
+      ad_spend_amount: number;
+      clicks: number;
+      impressions: number;
+      attributed_revenue_amount: number;
+      advertising_campaigns: { name: string } | { name: string }[];
+    };
+
+    const rows: AdvertisingSpend[] = (data as MetricRow[]).map((row) => {
+      const campaign = Array.isArray(row.advertising_campaigns)
+        ? row.advertising_campaigns[0]
+        : row.advertising_campaigns;
+      return {
+        sku: campaign?.name ?? "Campanha",
+        amount: row.ad_spend_amount,
+        clicks: row.clicks,
+        impressions: row.impressions,
+        attributedRevenue: row.attributed_revenue_amount
+      };
+    });
+
+    if (rows.length > 0) setAdsData(rows);
+  }, [supabaseClient]);
+
   const loadCostCenter = useCallback(async (organizationId: string) => {
     if (!supabaseClient) return;
 
@@ -602,7 +699,9 @@ export function DashmarketDashboard() {
         if (currentOrganization) {
           await Promise.all([
             loadCostCenter(currentOrganization.id),
-            loadSalesData(currentOrganization.id)
+            loadSalesData(currentOrganization.id),
+            loadInventory(currentOrganization.id),
+            loadAds(currentOrganization.id)
           ]);
         } else {
           setCosts([]);
@@ -625,7 +724,7 @@ export function DashmarketDashboard() {
     return () => {
       isMounted = false;
     };
-  }, [loadCostCenter, loadSalesData, supabaseClient]);
+  }, [loadCostCenter, loadSalesData, loadInventory, loadAds, supabaseClient]);
 
   async function addCost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -714,6 +813,8 @@ export function DashmarketDashboard() {
     setRealProducts([]);
     setCosts(costsSeed);
     setSalesData(salesSeed);
+    setInventoryData(inventoryRows);
+    setAdsData(adSpendSeed);
     setDataMessage("Sessao encerrada.");
   }
 
@@ -741,21 +842,34 @@ export function DashmarketDashboard() {
       const result = (await response.json()) as {
         ok?: boolean;
         error?: string;
-        accounts?: { records_processed?: number; error?: string }[];
+        accounts?: {
+          resources?: Record<string, { records_processed?: number }>;
+        }[];
       };
 
       if (!response.ok) {
         throw new Error(result.error ?? "Erro ao sincronizar.");
       }
 
-      const processed =
-        result.accounts?.reduce((sum, a) => sum + (a.records_processed ?? 0), 0) ?? 0;
+      const orders =
+        result.accounts?.reduce(
+          (sum, account) =>
+            sum +
+            (account.resources?.["mercadolivre-sync-orders"]?.records_processed ?? 0),
+          0
+        ) ?? 0;
 
       if (organization) {
-        await loadSalesData(organization.id);
+        await Promise.all([
+          loadSalesData(organization.id),
+          loadInventory(organization.id),
+          loadAds(organization.id)
+        ]);
       }
 
-      setDataMessage(`Sincronizacao concluida. ${processed} pedido(s) processado(s).`);
+      setDataMessage(
+        `Sincronizacao concluida. ${orders} pedido(s) processado(s).`
+      );
     } catch (error) {
       setDataMessage(
         error instanceof Error ? error.message : "Erro ao sincronizar vendas."
@@ -1237,8 +1351,8 @@ export function DashmarketDashboard() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-black/10">
-                      {inventoryRows.map((row) => (
-                        <tr key={row.sku}>
+                      {inventoryData.map((row) => (
+                        <tr key={`${row.sku}-${row.channel}`}>
                           <td className="px-4 py-3 font-bold">{row.sku}</td>
                           <td className="px-4 py-3">{row.channel}</td>
                           <td className="px-4 py-3">{formatNumber.format(row.available)}</td>
@@ -1302,7 +1416,7 @@ export function DashmarketDashboard() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-black/10">
-                      {adSpendSeed.map((row) => (
+                      {adsData.map((row) => (
                         <tr key={row.sku}>
                           <td className="px-4 py-3 font-bold">{row.sku}</td>
                           <td className="px-4 py-3">
@@ -1316,7 +1430,9 @@ export function DashmarketDashboard() {
                             {formatCurrency.format(row.attributedRevenue)}
                           </td>
                           <td className="px-4 py-3 font-bold">
-                            {formatPercent(row.amount / row.attributedRevenue)}
+                            {row.attributedRevenue > 0
+                              ? formatPercent(row.amount / row.attributedRevenue)
+                              : "—"}
                           </td>
                         </tr>
                       ))}
